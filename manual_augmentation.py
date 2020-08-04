@@ -7,23 +7,20 @@ from scipy.ndimage import binary_erosion, binary_dilation
 import skimage
 from skimage import measure
 
-import dlib 
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor('libs/shape_predictor_68_face_landmarks.dat')
 
-def remove_landmark(image, landmarks):
+def remove_landmark(image, landmarks, cutout_fill):
     if random.random() > 0.5:
-        image = remove_eyes(image, landmarks)
+        image = remove_eyes(image, landmarks, cutout_fill)
     elif random.random() > 0.5:
-        image = remove_mouth(image, landmarks)
+        image = remove_mouth(image, landmarks, cutout_fill)
     elif random.random() > 0.5:
-        image = remove_nose(image, landmarks)
+        image = remove_nose(image, landmarks, cutout_fill)
     return image
 
 def dist(p1, p2):
     return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
-def remove_eyes(image, landmarks):
+def remove_eyes(image, landmarks, cutout_fill):
     image = image.copy()
     (x1, y1), (x2, y2) = landmarks[:2]
     mask = np.zeros_like(image[..., 0])
@@ -31,10 +28,13 @@ def remove_eyes(image, landmarks):
     w = dist((x1, y1), (x2, y2))
     dilation = int(w // 4)
     line = binary_dilation(line, iterations=dilation)
-    image[line, :] = 0
+    if cutout_fill == 0:
+        image[line, :] = 0
+    else:
+       image[line, :] = np.random.randint(0,255,image[line,:].shape)
     return image
 
-def remove_mouth(image, landmarks):
+def remove_mouth(image, landmarks, cutout_fill):
     image = image.copy()
     (x1, y1), (x2, y2) = landmarks[-2:]
     mask = np.zeros_like(image[..., 0])
@@ -42,10 +42,13 @@ def remove_mouth(image, landmarks):
     w = dist((x1, y1), (x2, y2))
     dilation = int(w // 3)
     line = binary_dilation(line, iterations=dilation)
-    image[line, :] = 0
+    if cutout_fill == 0:
+        image[line, :] = 0
+    else:
+       image[line, :] = np.random.randint(0,255,image[line,:].shape)
     return image
 
-def remove_nose(image, landmarks):
+def remove_nose(image, landmarks, cutout_fill):
     image = image.copy()
     (x1, y1), (x2, y2) = landmarks[:2]
     x3, y3 = landmarks[2]
@@ -56,43 +59,45 @@ def remove_nose(image, landmarks):
     w = dist((x1, y1), (x2, y2))
     dilation = int(w // 4)
     line = binary_dilation(line, iterations=dilation)
-    image[line, :] = 0
+    if cutout_fill == 0:
+        image[line, :] = 0
+    else:
+       image[line, :] = np.random.randint(0,255,image[line,:].shape)
     return image
 
-def blackout_convex_hull(img):
-    try:
-        rects = detector(img)
-        if(len(rects) == 0):
-            return
-        sp = predictor(img, rects[0])
-        landmarks = np.array([[p.x, p.y] for p in sp.parts()])
-        outline = landmarks[[*range(17), *range(26, 16, -1)]]
-        Y, X = skimage.draw.polygon(outline[:, 1], outline[:, 0])
-        cropped_img = np.zeros(img.shape[:2], dtype=np.uint8)
-        cropped_img[Y, X] = 1
-        # if random.random() > 0.5:
-        #     img[cropped_img == 0] = 0
-        #     #leave only face
-        #     return img
-
-        y, x = measure.centroid(cropped_img)
-        y = int(y)
-        x = int(x)
-        first = random.random() > 0.5
-        if random.random() > 0.5:
-            if first:
-                cropped_img[:y, :] = 0
-            else:
-                cropped_img[y:, :] = 0
+def blackout_convex_hull(img, detector, predictor, cutout_fill):
+    rects = detector(img)
+    if(len(rects) == 0):
+        return
+    sp = predictor(img, rects[0])
+    landmarks = np.array([[p.x, p.y] for p in sp.parts()])
+    outline = landmarks[[*range(17), *range(26, 16, -1)]]
+    Y, X = skimage.draw.polygon(outline[:, 1], outline[:, 0])
+    cropped_img = np.zeros(img.shape[:2], dtype=np.uint8)
+    cropped_img[Y, X] = 1
+    # if random.random() > 0.5:
+    #     img[cropped_img == 0] = 0
+    #     #leave only face
+    #     return img
+    y, x = measure.centroid(cropped_img)
+    y = int(y)
+    x = int(x)
+    first = random.random() > 0.5
+    if random.random() > 0.5:
+        if first:
+            cropped_img[:y, :] = 0
         else:
-            if first:
-                cropped_img[:, :x] = 0
-            else:
-                cropped_img[:, x:] = 0
-        
+            cropped_img[y:, :] = 0
+    else:
+        if first:
+            cropped_img[:, :x] = 0
+        else:
+            cropped_img[:, x:] = 0
+    if(cutout_fill == 0):
         img[cropped_img > 0] = 0
-    except Exception as e:
-        print(e)
+    else:
+        img[cropped_img > 0] = np.random.randint(0,255,img[cropped_img > 0].shape)
+    
 
 def prepare_bit_masks(mask):
     h, w = mask.shape

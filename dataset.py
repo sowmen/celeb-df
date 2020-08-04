@@ -13,15 +13,21 @@ from albumentations.augmentations.functional import  rot90
 from albumentations.pytorch.functional import img_to_tensor
 from manual_augmentation import remove_landmark, prepare_bit_masks, change_padding,\
                                 blackout_convex_hull, blackout_random
+from torchvision.transforms import RandomErasing
 
-
+import dlib 
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor('libs/shape_predictor_68_face_landmarks.dat')
 
 class CelebDF_Dataset(Dataset):
     
     def __init__(self,
                  data_root,
                  mode = 'train',
-                 val_fold = 0,
+                 val_fold = 1,
+                 test_fold = 0,
+                 cutout_fill = 0,
+                 random_erase = False,
                  crops_dir = 'face_crops',
                  folds_csv = 'folds.csv',
                  oversample_real = True, # Equalizes number of real and fake frames
@@ -39,6 +45,9 @@ class CelebDF_Dataset(Dataset):
         self.data_root = data_root
         self.mode = mode
         self.val_fold = val_fold
+        self.test_fold = test_fold
+        self.cutout_fill = cutout_fill
+        self.random_erase = random_erase
         self.crops_dir = crops_dir
         self.folds_csv = folds_csv
         self.oversample_real = oversample_real
@@ -68,17 +77,24 @@ class CelebDF_Dataset(Dataset):
                     
         
         # Applying hardcore augmentations without rotation
-        if self.mode == "train" and self.hardcore and not self.rotation:
+        if self.mode == "train" and self.hardcore and not self.rotation and not self.random_erase:
             landmark_path = os.path.join(self.data_root, "landmarks", ori_video, img_file[:-4] + ".npy")
             
             # Remove facial features using landmark informations
             if os.path.exists(landmark_path) and random.random() < 0.7:
                 landmarks = np.load(landmark_path)
-                image = remove_landmark(image, landmarks)
+                image = remove_landmark(image, landmarks, self.cutout_fill)
             
             # Remove facial parts using convex hull
             elif random.random() < 0.4:
-                blackout_convex_hull(image)
+                err = 0
+                cp = np.copy(image)
+                try:
+                    blackout_convex_hull(cp, detector, predictor, self.cutout_fill)
+                except Exception:
+                    err = 1                
+                if err == 0:
+                    image = cp
                 
             # Remove parts of image randomly from 6 bitmasks
             # elif random.random() < 0.1:
@@ -130,6 +146,10 @@ class CelebDF_Dataset(Dataset):
         #     cv2.imwrite(os.path.join("train_images", video+ "_" + str(1 if label > 0.5 else 0) + "_"+img_file), image[...,::-1])
         
         image = img_to_tensor(image, self.normalize)
+
+        if self.mode == "train" and self.random_erase:
+            image = RandomErasing(p=0.5, scale=(0.02,0.2), value="random")(image)
+
         return {
             "image": image, 
             "label": np.array((label,)), 
@@ -156,9 +176,11 @@ class CelebDF_Dataset(Dataset):
     def _prepare_data(self, seed) -> list:
         df = self.df
         if self.mode == "train":
-            rows = df[df["fold"] != self.val_fold]
-        else:
+            rows = df[~df["fold"].isin([self.val_fold, self.test_fold]) ]
+        elif self.mode == "val":
             rows = df[df["fold"] == self.val_fold]
+        else:
+            rows = df[df["fold"] == self.test_fold]
             
         seed += 1
 

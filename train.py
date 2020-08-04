@@ -36,11 +36,17 @@ from sklearn import metrics
 
 from utils import EarlyStopping, AverageMeter
 
+import neptune
+from neptunecontrib.monitoring.metrics import log_binary_classification_metrics
+
+import scikitplot as skplt
+import matplotlib.pyplot as plt
+
 DATA_ROOT = 'face_data'
 OUTPUT_DIR = 'weights'
 device = 'cuda'
 config_defaults = {
-    'epochs' : 30,
+    'epochs' : 20,
     'train_batch_size' : 40,
     'valid_batch_size' : 32,
     'optimizer' : 'radam',
@@ -49,14 +55,16 @@ config_defaults = {
     'schedule_patience' : 5,
     'schedule_factor' : 0.25,
     'rand_seed' : 777,
-    'oversample' : True
+    'cutout_fill' : 1
 }
+VAL_FOLD = 9
+TEST_FOLD = 0
 
-def train(name, val_fold, run, folds_csv):
+def train(name, run, folds_csv):
     
     wandb.init(project='dfdc', 
                config=config_defaults,
-               name=f'{name},val_fold:{val_fold},run{run}')
+               name=f'{name},val_fold:{VAL_FOLD},run{run}')
     config = wandb.config
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -79,19 +87,22 @@ def train(name, val_fold, run, folds_csv):
         optimizer,
         patience=config.schedule_patience,
         threshold=0.001,
-        mode="max",
+        mode="min",
         factor = config.schedule_factor
     )
     criterion = nn.BCEWithLogitsLoss()
-    es = EarlyStopping(patience = 8, mode='max')
+    es = EarlyStopping(patience = 10, mode='min')
     
     data_train = CelebDF_Dataset(data_root=DATA_ROOT,
-                              mode='train',
-                              folds_csv=folds_csv,
-                              val_fold=val_fold,
-                              hardcore=True,
-                              oversample_real=config.oversample,
-                              transforms=create_train_transforms(size=224))
+                                mode='train',
+                                folds_csv=folds_csv,
+                                val_fold=VAL_FOLD,
+                                test_fold=TEST_FOLD,
+                                cutout_fill=config.cutout_fill,
+                                hardcore=False,
+                                random_erase=True,
+                                oversample_real=True,
+                                transforms=create_train_transforms(size=224))
     data_train.reset(config.rand_seed)
     train_data_loader = DataLoader( data_train, 
                                     batch_size=config.train_batch_size, 
@@ -100,11 +111,13 @@ def train(name, val_fold, run, folds_csv):
                                     drop_last=True)
 
     data_val = CelebDF_Dataset(data_root=DATA_ROOT,
-                            mode='val',
-                            folds_csv=folds_csv,
-                            val_fold=val_fold,
-                            hardcore=False,
-                            transforms=create_val_transforms(size=224))
+                                mode='val',
+                                folds_csv=folds_csv,
+                                val_fold=VAL_FOLD,
+                                test_fold=TEST_FOLD,
+                                hardcore=False,
+                                oversample_real=False,
+                                transforms=create_val_transforms(size=224))
     data_val.reset(config.rand_seed)
 
     val_data_loader = DataLoader(data_val, 
@@ -113,10 +126,25 @@ def train(name, val_fold, run, folds_csv):
                                  shuffle=False, 
                                  drop_last=True)
     
+    data_test = CelebDF_Dataset(data_root=DATA_ROOT,
+                            mode='test',
+                            folds_csv=folds_csv,
+                            val_fold=VAL_FOLD,
+                            test_fold=TEST_FOLD,
+                            hardcore=False,
+                            oversample_real=False,
+                            transforms=create_val_transforms(size=224))
+    data_test.reset(config.rand_seed)
+
+    test_data_loader = DataLoader(data_test, 
+                                 batch_size=config.valid_batch_size, 
+                                 num_workers=8, 
+                                 shuffle=False, 
+                                 drop_last=True)
 
     train_history = []
     val_history = []
-    
+    test_history = []
     
     for epoch in range(config.epochs):
         print(f"Epoch = {epoch}/{config.epochs-1}")
@@ -124,7 +152,7 @@ def train(name, val_fold, run, folds_csv):
         
         train_metrics = train_epoch(model, train_data_loader, optimizer, criterion, epoch)
         valid_metrics = valid_epoch(model, val_data_loader, criterion, epoch)
-        scheduler.step(valid_metrics['valid_auc'])
+        scheduler.step(valid_metrics['valid_loss'])
 
         print(f"TRAIN_AUC = {train_metrics['train_auc']}, TRAIN_LOSS = {train_metrics['train_loss']}")
         print(f"VALID_AUC = {valid_metrics['valid_auc']}, VALID_LOSS = {valid_metrics['valid_loss']}")
@@ -132,18 +160,26 @@ def train(name, val_fold, run, folds_csv):
         train_history.append(train_metrics)
         val_history.append(valid_metrics)
 
-        es(valid_metrics['valid_auc'], model, model_path=os.path.join(OUTPUT_DIR,f"{name}_fold_{val_fold}_run_{run}.h5"))
+        es(valid_metrics['valid_loss'], model, model_path=os.path.join(OUTPUT_DIR,f"{name}_fold_{VAL_FOLD}_run_{run}.h5"))
         if es.early_stop:
             print("Early stopping")
             break
     
+    model.load_state_dict(torch.load(f'weights/{name}_fold_{VAL_FOLD}_run_{run}.h5'))
+
+    neptune.init('sowmen/dfdc')
+    neptune.create_experiment(name=f'{name},val_fold:{VAL_FOLD},run{run}')
+
+    test_history = test(model, test_data_loader, criterion)
+
     try:
         pkl.dump( train_history, open( f"train_history{name}{run}.pkl", "wb" ) )
         pkl.dump( val_history, open( f"val_history{name}{run}.pkl", "wb" ) )
+        pkl.dump( test_history, open( f"test_history{name}{run}.pkl", "wb" ) )
     except:
         print("Error pickling")
 
-    wandb.save(f'weights/{name}_fold_{val_fold}_run_{run}.h5')
+    wandb.save(f'weights/{name}_fold_{VAL_FOLD}_run_{run}.h5')
       
     
     
@@ -182,14 +218,18 @@ def train_epoch(model, train_data_loader, optimizer, criterion, epoch):
                 train_f1_05 = metrics.f1_score(temp_t,(temp_correct_preds >= 0.5)*1)
                 train_acc_05 = metrics.accuracy_score(temp_t,(temp_correct_preds >= 0.5)*1)
                 train_balanced_acc_05 = metrics.balanced_accuracy_score(temp_t,(temp_correct_preds >= 0.5)*1)
-
+                train_ap = metrics.average_precision_score(temp_t, temp_correct_preds)
+                train_log_loss = metrics.log_loss(temp_t, expand_prediction(temp_correct_preds))
+                
                 train_metrics = {
                     'b_train_loss' : train_loss.avg,
                     'b_train_auc' : train_auc,
                     'b_train_f1_05' : train_f1_05,
                     'b_train_acc_05' : train_acc_05,
                     'b_train_balanced_acc_05' : train_balanced_acc_05,
-                    'b_train_batch' : idx
+                    'b_train_batch' : idx,
+                    'b_train_ap' : train_ap,
+                    'b_train_log_loss' : train_log_loss
                 }
                 wandb.log(train_metrics)
         idx += 1
@@ -202,13 +242,17 @@ def train_epoch(model, train_data_loader, optimizer, criterion, epoch):
         train_f1_05 = metrics.f1_score(targets,(correct_predictions >= 0.5)*1)
         train_acc_05 = metrics.accuracy_score(targets,(correct_predictions >= 0.5)*1)
         train_balanced_acc_05 = metrics.balanced_accuracy_score(targets,(correct_predictions >= 0.5)*1)
-    
+        train_ap = metrics.average_precision_score(targets, correct_predictions)
+        train_log_loss = metrics.log_loss(targets, expand_prediction(correct_predictions))
+
     train_metrics = {
         'train_loss' : train_loss.avg,
         'train_auc' : train_auc,
         'train_f1_05' : train_f1_05,
         'train_acc_05' : train_acc_05,
         'train_balanced_acc_05' : train_balanced_acc_05,
+        'train_ap' : train_ap,
+        'train_log_loss' : train_log_loss,
         'epoch' : epoch
     }
     wandb.log(train_metrics)
@@ -258,6 +302,8 @@ def valid_epoch(model, val_data_loader, criterion, epoch):
                 valid_f1_05 = metrics.f1_score(temp_t,(temp_correct_preds >= 0.5)*1)
                 valid_acc_05 = metrics.accuracy_score(temp_t,(temp_correct_preds >= 0.5)*1)
                 valid_balanced_acc_05 = metrics.balanced_accuracy_score(temp_t,(temp_correct_preds >= 0.5)*1)
+                valid_ap = metrics.average_precision_score(temp_t, temp_correct_preds)
+                valid_log_loss = metrics.log_loss(temp_t, expand_prediction(temp_correct_preds))
 
                 valid_metrics = {
                     'b_valid_loss' : valid_loss.avg,
@@ -265,6 +311,8 @@ def valid_epoch(model, val_data_loader, criterion, epoch):
                     'b_valid_f1_05' : valid_f1_05,
                     'b_valid_acc_05' : valid_acc_05,
                     'b_valid_balanced_acc_05' : valid_balanced_acc_05,
+                    'b_valid_ap' :  valid_ap,
+                    'b_valid_log_loss' : valid_log_loss,
                     'b_valid_batch' : idx
                 }
                 wandb.log(valid_metrics)
@@ -278,20 +326,81 @@ def valid_epoch(model, val_data_loader, criterion, epoch):
     valid_f1_05 = metrics.f1_score(targets,(correct_predictions >= 0.5)*1)
     valid_acc_05 = metrics.accuracy_score(targets,(correct_predictions >= 0.5)*1)
     valid_balanced_acc_05 = metrics.balanced_accuracy_score(targets,(correct_predictions >= 0.5)*1)
-    
+    valid_ap = metrics.average_precision_score(targets, correct_predictions)
+    valid_log_loss = metrics.log_loss(targets, expand_prediction(correct_predictions))
+
     valid_metrics = {
         'valid_loss' : valid_loss.avg,
         'valid_auc' : valid_auc,
         'valid_f1_05' : valid_f1_05,
         'valid_acc_05' : valid_acc_05,
         'valid_balanced_acc_05' : valid_balanced_acc_05,
-        'valid_examples' : example_images[-50:],
+        'valid_ap' : valid_ap,
+        'valid_log_loss' : valid_log_loss,
+        'valid_examples' : example_images[-10:],
         'epoch' : epoch
     }
     wandb.log(valid_metrics)
 
     return valid_metrics
+
+def test(model, test_data_loader, criterion):
+    model.eval()
     
+    test_loss = AverageMeter()
+    correct_predictions = []
+    targets = []
+
+    with torch.no_grad():        
+        for batch in tqdm(test_data_loader):
+            # batch_image_names = batch['image_name']
+            batch_images = batch['image'].to(device).float()
+            batch_labels = batch['label'].to(device).float()
+            
+            out = model(batch_images)
+            loss = criterion(out, batch_labels.view(-1, 1).type_as(out))
+            
+            test_loss.update(loss.item(), test_data_loader.batch_size)
+            batch_targets = (batch_labels.view(-1,1).cpu() >= 0.5) *1
+            batch_preds = torch.sigmoid(out).cpu()
+            
+            targets.append(batch_targets)
+            correct_predictions.append(batch_preds)
+
+    # Logging
+    targets = np.vstack((targets)).ravel()
+    correct_predictions = np.vstack((correct_predictions)).ravel()
+
+    test_auc = metrics.roc_auc_score(targets, correct_predictions)
+    test_f1_05 = metrics.f1_score(targets,(correct_predictions >= 0.5)*1)
+    test_acc_05 = metrics.accuracy_score(targets,(correct_predictions >= 0.5)*1)
+    test_balanced_acc_05 = metrics.balanced_accuracy_score(targets,(correct_predictions >= 0.5)*1)
+    test_ap = metrics.average_precision_score(targets, correct_predictions)
+    test_log_loss = metrics.log_loss(targets, expand_prediction(correct_predictions))
+
+    test_metrics = {
+        'test_loss' : test_loss.avg,
+        'test_auc' : test_auc,
+        'test_f1_05' : test_f1_05,
+        'test_acc_05' : test_acc_05,
+        'test_balanced_acc_05' : test_balanced_acc_05,
+        'test_ap' : test_ap,
+        'test_log_loss' : test_log_loss
+    }
+    wandb.log(test_metrics)
+    wandb.log({
+        'test_roc_auc_curve' : skplt.metrics.plot_roc(targets, expand_prediction(correct_predictions)),
+        'test_precision_recall_curve' : skplt.metrics.plot_precision_recall(targets, expand_prediction(correct_predictions))
+    })
+    log_binary_classification_metrics(targets, expand_prediction(correct_predictions), threshold=0.5)
+
+
+    return test_metrics
+
+def expand_prediction(arr):
+    arr_reshaped = arr.reshape(-1, 1)
+    return np.clip(np.concatenate((1.0 - arr_reshaped, arr_reshaped), axis=1), 0.0, 1.0)
+
 def create_train_transforms(size=224):
     return Compose([
         ImageCompression(quality_lower=70, quality_upper=100, p=0.5),
@@ -317,7 +426,7 @@ def create_val_transforms(size=224):
     ])
 
     
-if __name__ == "__main__":
-    run = 1
+if __name__ == "__main__":  
+    run = 8
     model_name = 'xception'
-    train(name='CelebDF_hardcore,'+model_name, val_fold=1, run=run, folds_csv='folds.csv')
+    train(name='01CelebDF_random_erase_minloss,'+model_name, run=run, folds_csv='folds.csv')
