@@ -29,7 +29,6 @@ run/
 weights/
 *.pkl
 wandb/
-ff_data/
 libs/
 face_data/
 # Remove previous ipynb_checkpoints
